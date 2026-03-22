@@ -47,7 +47,8 @@ log = logging.getLogger("raptorreview")
 # Constants
 # ---------------------------------------------------------------------------
 
-# Token budget for the diff sent to the model.
+# Token budget for the diff sent to the model.  Keeps us inside free-tier
+# context limits while covering the majority of real-world PRs.
 MAX_DIFF_TOKENS: int = 3_000
 
 # Delays (seconds) between retries when Groq returns HTTP 429.
@@ -60,8 +61,9 @@ FALLBACK_MODELS: list[str] = [
     "gemma2-9b-it",
 ]
 
-# Glob patterns for files excluded from the diff before sending to the model.
-# These are noise — generated, minified, or lock files the LLM cannot usefully review.
+# Glob patterns for files that should be excluded from the diff before it is
+# sent to the model.  These are noise — generated, minified, or lock files
+# that the LLM cannot meaningfully review.
 SKIP_PATTERNS: list[str] = [
     "*.lock",
     "package-lock.json",
@@ -113,8 +115,8 @@ explanation outside the JSON. The object must conform exactly to this schema:
 }
 
 Set "line" to 0 if a comment does not map to a specific line. The "comments" \
-array may be empty if the diff is clean. Only report issues clearly visible \
-in the diff — never fabricate problems."""
+array may be empty if the diff is clean. Only report issues that are clearly \
+visible in the diff — never fabricate problems."""
 
 
 # ---------------------------------------------------------------------------
@@ -268,8 +270,8 @@ def parse_diff_hunks(diff: str) -> dict[str, set[int]]:
     """Parse a unified diff and return the set of new-file line numbers per file.
 
     Only lines that appear as additions (+) in the diff are included — these
-    are the only positions the GitHub Reviews API accepts for inline comments
-    with side=RIGHT.
+    are the only line positions the GitHub Reviews API will accept for inline
+    comments with side=RIGHT.
     """
     file_lines: dict[str, set[int]] = {}
     current_file: str | None = None
@@ -331,7 +333,7 @@ def apply_codeowners_boost(
 ) -> list[ReviewComment]:
     """Escalate severity by one level for findings in CODEOWNERS-tracked files.
 
-    suggestion -> warning -> critical. Critical stays critical.
+    suggestion -> warning -> critical.  Critical stays critical.
     """
     if not patterns:
         return comments
@@ -348,7 +350,7 @@ def apply_codeowners_boost(
                 idx = order.index(sev) if sev in order else 0
                 sev = order[min(idx + 1, len(order) - 1)]
                 log.debug(
-                    "CODEOWNERS boost: %s:%d  %s -> %s",
+                    "CODEOWNERS boost: %s:%d %s -> %s",
                     c.file, c.line, c.severity, sev,
                 )
                 break
@@ -444,8 +446,8 @@ def call_groq(
 ) -> tuple[dict[str, Any], str]:
     """Call Groq with an automatic model fallback chain.
 
-    Tries primary_model first, then each entry in FALLBACK_MODELS in order,
-    skipping any model Groq reports as decommissioned or not found.
+    Tries `primary_model` first, then each model in FALLBACK_MODELS in order.
+    Skips a model if Groq reports it as decommissioned or not found.
 
     Returns:
         (parsed_response_dict, model_that_succeeded)
@@ -472,7 +474,9 @@ def call_groq(
                 continue
             raise
 
-    raise RuntimeError(f"All models in fallback chain exhausted: {chain}")
+    raise RuntimeError(
+        f"All models in fallback chain exhausted: {chain}"
+    )
 
 
 def parse_review(payload: dict[str, Any]) -> ReviewResult:
@@ -653,9 +657,11 @@ def build_inline_comments(
 ) -> list[dict[str, Any]]:
     """Convert ReviewComment objects into GitHub Reviews API comment dicts.
 
-    Uses the parsed diff hunk map to validate line numbers. When the LLM
-    returns a line close to (but not exactly on) a changed line, the comment
-    is snapped to the nearest valid line within a 5-line tolerance.
+    Uses the parsed diff hunk map to validate line numbers.  When the LLM
+    returns a line that is close to (but not exactly on) a changed line, the
+    comment is snapped to the nearest valid line within a 5-line tolerance.
+    Comments that cannot be placed are omitted from inline and remain visible
+    in the summary list.
     """
     diff_line_map = parse_diff_hunks(diff)
     inline: list[dict[str, Any]] = []
@@ -788,8 +794,8 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Call Groq and parse the structured response
     # ------------------------------------------------------------------
-    gh            = _gh_session(github_token)
-    groq_client   = Groq(api_key=groq_api_key)
+    gh           = _gh_session(github_token)
+    groq_client  = Groq(api_key=groq_api_key)
     system_prompt = custom_prompt or DEFAULT_SYSTEM_PROMPT
 
     try:
