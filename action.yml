@@ -22,7 +22,7 @@ inputs:
         - llama-3.1-70b-versatile  (recommended: thorough, slower)
         - llama-3.1-8b-instant     (faster, lighter context window)
     required: false
-    default: "llama-3.1-70b-versatile"
+    default: "llama-3.3-70b-versatile"
 
   temperature:
     description: >
