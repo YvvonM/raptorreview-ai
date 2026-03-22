@@ -1,0 +1,56 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install --quiet ruff
+
+      - name: Check style and correctness
+        run: ruff check src/
+
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime dependencies
+        run: pip install --quiet -r requirements.txt
+
+      - name: Verify module imports cleanly
+        run: |
+          PYTHONPATH=src python -c "import review; print('Import OK')"
+
+      - name: Validate action.yml is well-formed YAML
+        run: |
+          python -c "
+          import yaml, sys
+          with open('action.yml') as f:
+              data = yaml.safe_load(f)
+          assert data.get('runs', {}).get('using') == 'composite', 'Expected composite action'
+          print('action.yml OK')
+          "

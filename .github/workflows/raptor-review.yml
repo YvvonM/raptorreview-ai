@@ -1,0 +1,34 @@
+name: RaptorReview AI
+
+# Trigger on all standard PR lifecycle events.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# Minimal permissions: read the code, write PR comments. Nothing else.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: AI Code Review
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history is required for `git diff origin/<base>...HEAD`
+          fetch-depth: 0
+
+      - name: Run RaptorReview AI
+        uses: dev-k99/raptorreview-ai@v1
+        with:
+          groq_api_key: ${{ secrets.GROQ_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Optional overrides — remove any you don't need:
+          model:         "llama-3.1-70b-versatile"
+          temperature:   "0.2"
+          max_tokens:    "2048"
+          # custom_prompt: ""

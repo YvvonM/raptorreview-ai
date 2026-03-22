@@ -1,0 +1,77 @@
+name: "RaptorReview AI"
+description: "AI-powered pull request code review using the Groq free-tier inference API."
+author: "RaptorReview AI"
+
+branding:
+  icon: "eye"
+  color: "blue"
+
+inputs:
+  groq_api_key:
+    description: >
+      Groq API key used to call the inference endpoint.
+      Store this as a repository secret and pass it via
+      ${{ secrets.GROQ_API_KEY }}.
+    required: true
+
+  github_token:
+    description: >
+      GitHub token used to post review comments. The default
+      ${{ github.token }} is sufficient when pull-requests: write
+      is granted in the workflow permissions block.
+    required: true
+    default: ${{ github.token }}
+
+  model:
+    description: >
+      Groq model identifier. Both options below are on the free tier as of 2026:
+        - llama-3.1-70b-versatile  (recommended: thorough, slower)
+        - llama-3.1-8b-instant     (faster, lighter context window)
+    required: false
+    default: "llama-3.1-70b-versatile"
+
+  temperature:
+    description: >
+      Sampling temperature in the range [0.0, 1.0]. Lower values produce more
+      deterministic, consistent reviews. 0.2 is a reasonable default.
+    required: false
+    default: "0.2"
+
+  max_tokens:
+    description: >
+      Maximum number of tokens in the model's response. Increase this if
+      reviews are being cut off on large diffs.
+    required: false
+    default: "2048"
+
+  custom_prompt:
+    description: >
+      Fully replace the default system prompt. Useful for enforcing language-
+      or domain-specific review rules. Leave empty to use the built-in prompt.
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        pip install --quiet --upgrade pip
+        pip install --quiet -r "${{ github.action_path }}/requirements.txt"
+
+    - name: Run RaptorReview
+      shell: bash
+      env:
+        GROQ_API_KEY:         ${{ inputs.groq_api_key }}
+        GITHUB_TOKEN:         ${{ inputs.github_token }}
+        INPUT_MODEL:          ${{ inputs.model }}
+        INPUT_TEMPERATURE:    ${{ inputs.temperature }}
+        INPUT_MAX_TOKENS:     ${{ inputs.max_tokens }}
+        INPUT_CUSTOM_PROMPT:  ${{ inputs.custom_prompt }}
+      run: python "${{ github.action_path }}/src/review.py"
