@@ -17,10 +17,7 @@ inputs:
     default: ${{ github.token }}
 
   model:
-    description: >
-      Groq model identifier. Both options below are on the free tier as of 2026:
-        - llama-3.1-70b-versatile  (recommended: thorough, slower)
-        - llama-3.1-8b-instant     (faster, lighter context window)
+    description: "Primary Groq model. Falls back automatically to llama-3.1-8b-instant then gemma2-9b-it if the primary is unavailable."
     required: false
     default: "llama-3.3-70b-versatile"
 

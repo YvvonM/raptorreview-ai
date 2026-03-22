@@ -17,6 +17,7 @@ Environment variables (set by action.yml):
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import os
@@ -28,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import requests
+import tiktoken
 from groq import APIConnectionError, APIStatusError, Groq
 
 # ---------------------------------------------------------------------------
@@ -45,12 +47,40 @@ log = logging.getLogger("raptorreview")
 # Constants
 # ---------------------------------------------------------------------------
 
-# ~3 000 tokens at average 4 chars/token.  Keeps us well inside free-tier
-# context limits while still covering the majority of real-world PRs.
-MAX_DIFF_CHARS: int = 12_000
+# Token budget for the diff sent to the model.
+MAX_DIFF_TOKENS: int = 3_000
 
 # Delays (seconds) between retries when Groq returns HTTP 429.
 RETRY_DELAYS: list[int] = [2, 5, 15]
+
+# Models tried in order when the primary model is unavailable or decommissioned.
+FALLBACK_MODELS: list[str] = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "gemma2-9b-it",
+]
+
+# Glob patterns for files excluded from the diff before sending to the model.
+# These are noise — generated, minified, or lock files the LLM cannot usefully review.
+SKIP_PATTERNS: list[str] = [
+    "*.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "poetry.lock",
+    "pnpm-lock.yaml",
+    "*.min.js",
+    "*.min.css",
+    "*.pb.go",
+    "*.generated.*",
+    "*.gen.*",
+    "dist/*",
+    "build/*",
+    ".next/*",
+    "node_modules/*",
+    "vendor/*",
+    "__pycache__/*",
+    "*.pyc",
+]
 
 SEVERITY_LABELS: dict[str, str] = {
     "critical":   "[CRITICAL]",
@@ -72,7 +102,7 @@ explanation outside the JSON. The object must conform exactly to this schema:
   "comments": [
     {
       "file": "<relative file path, e.g. src/auth.py>",
-      "line": <integer line number in the new version of the file>,
+      "line": <integer line number in the NEW version of the file>,
       "severity": "<critical|warning|suggestion>",
       "title": "<concise issue title, max 80 chars>",
       "suggestion": "<concrete fix or alternative — code snippet preferred>",
@@ -83,8 +113,8 @@ explanation outside the JSON. The object must conform exactly to this schema:
 }
 
 Set "line" to 0 if a comment does not map to a specific line. The "comments" \
-array may be empty if the diff is clean. Never fabricate issues that are not \
-present in the diff."""
+array may be empty if the diff is clean. Only report issues clearly visible \
+in the diff — never fabricate problems."""
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +154,24 @@ class ReviewResult:
 
 
 # ---------------------------------------------------------------------------
-# Diff acquisition
+# Token counting
+# ---------------------------------------------------------------------------
+
+
+def count_tokens(text: str) -> int:
+    """Count tokens using cl100k_base (GPT-4 / Llama-compatible encoding).
+
+    Falls back to a character-based estimate if tiktoken is unavailable.
+    """
+    try:
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    except Exception:  # noqa: BLE001
+        return len(text) // 4
+
+
+# ---------------------------------------------------------------------------
+# Diff acquisition and conditioning
 # ---------------------------------------------------------------------------
 
 
@@ -139,25 +186,184 @@ def get_diff(base_ref: str) -> str:
         return ""
 
 
-def truncate_diff(diff: str) -> tuple[str, bool]:
-    """Return (diff, was_truncated).
+def filter_diff(diff: str) -> tuple[str, list[str]]:
+    """Remove noise files from the unified diff.
 
-    When the diff exceeds MAX_DIFF_CHARS, it is cut at a line boundary so the
-    model never receives a half-formed hunk.
+    Splits the diff on 'diff --git' headers, checks each file path against
+    SKIP_PATTERNS, and reassembles only the sections worth reviewing.
+
+    Returns:
+        (filtered_diff, skipped_file_paths)
     """
-    if len(diff) <= MAX_DIFF_CHARS:
-        return diff, False
+    sections = re.split(r"(?=^diff --git )", diff, flags=re.MULTILINE)
+    kept: list[str] = []
+    skipped: list[str] = []
 
-    cut = diff[:MAX_DIFF_CHARS]
-    last_nl = cut.rfind("\n")
-    if last_nl > 0:
-        cut = cut[:last_nl]
+    for section in sections:
+        if not section.strip():
+            continue
+        header = section.split("\n")[0]
+        match = re.match(r"^diff --git a/.+ b/(.+)$", header)
+        if match:
+            filepath = match.group(1)
+            basename = os.path.basename(filepath)
+            if any(
+                fnmatch.fnmatch(filepath, p) or fnmatch.fnmatch(basename, p)
+                for p in SKIP_PATTERNS
+            ):
+                skipped.append(filepath)
+                continue
+        kept.append(section)
 
+    return "".join(kept), skipped
+
+
+def truncate_diff(diff: str) -> tuple[str, bool, int]:
+    """Truncate the diff to MAX_DIFF_TOKENS using binary search on line boundaries.
+
+    Returns:
+        (diff_text, was_truncated, final_token_count)
+    """
+    token_count = count_tokens(diff)
+    if token_count <= MAX_DIFF_TOKENS:
+        return diff, False, token_count
+
+    lines = diff.split("\n")
+    lo, hi = 0, len(lines)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if count_tokens("\n".join(lines[:mid])) <= MAX_DIFF_TOKENS:
+            lo = mid + 1
+        else:
+            hi = mid
+
+    cut = "\n".join(lines[: lo - 1])
     notice = (
-        "\n\n[DIFF TRUNCATED — only the first ~3 000 tokens were analyzed. "
+        "\n\n[DIFF TRUNCATED — only the first ~3,000 tokens were analyzed. "
         "Consider breaking this PR into smaller, focused changes.]"
     )
-    return cut + notice, True
+    final = cut + notice
+    return final, True, count_tokens(final)
+
+
+def parse_diff_stats(diff: str) -> tuple[int, int, int]:
+    """Extract summary statistics from a unified diff.
+
+    Returns:
+        (files_changed, lines_added, lines_removed)
+    """
+    files = set(re.findall(r"^\+\+\+ b/(.+)$", diff, re.MULTILINE))
+    added = sum(
+        1 for ln in diff.split("\n")
+        if ln.startswith("+") and not ln.startswith("+++")
+    )
+    removed = sum(
+        1 for ln in diff.split("\n")
+        if ln.startswith("-") and not ln.startswith("---")
+    )
+    return len(files), added, removed
+
+
+def parse_diff_hunks(diff: str) -> dict[str, set[int]]:
+    """Parse a unified diff and return the set of new-file line numbers per file.
+
+    Only lines that appear as additions (+) in the diff are included — these
+    are the only positions the GitHub Reviews API accepts for inline comments
+    with side=RIGHT.
+    """
+    file_lines: dict[str, set[int]] = {}
+    current_file: str | None = None
+    new_line_num: int = 0
+
+    for line in diff.split("\n"):
+        if line.startswith("diff --git "):
+            m = re.match(r"^diff --git a/.+ b/(.+)$", line)
+            if m:
+                current_file = m.group(1)
+                file_lines.setdefault(current_file, set())
+                new_line_num = 0
+        elif line.startswith("@@") and current_file:
+            m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            if m:
+                new_line_num = int(m.group(1)) - 1
+        elif current_file:
+            if line.startswith("+") and not line.startswith("+++"):
+                new_line_num += 1
+                file_lines[current_file].add(new_line_num)
+            elif not line.startswith("-") and not line.startswith("\\"):
+                new_line_num += 1
+
+    return file_lines
+
+
+# ---------------------------------------------------------------------------
+# CODEOWNERS
+# ---------------------------------------------------------------------------
+
+
+def load_codeowners_patterns(repo_root: str = ".") -> list[str]:
+    """Read ownership patterns from CODEOWNERS, if present.
+
+    Checks the three standard locations GitHub recognises.
+    Returns a list of path patterns (leading slash stripped).
+    """
+    candidates = [
+        os.path.join(repo_root, "CODEOWNERS"),
+        os.path.join(repo_root, ".github", "CODEOWNERS"),
+        os.path.join(repo_root, "docs", "CODEOWNERS"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            patterns: list[str] = []
+            with open(path, encoding="utf-8") as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if raw and not raw.startswith("#"):
+                        patterns.append(raw.split()[0].lstrip("/"))
+            log.info("Loaded %d CODEOWNERS pattern(s) from %s.", len(patterns), path)
+            return patterns
+    return []
+
+
+def apply_codeowners_boost(
+    comments: list[ReviewComment],
+    patterns: list[str],
+) -> list[ReviewComment]:
+    """Escalate severity by one level for findings in CODEOWNERS-tracked files.
+
+    suggestion -> warning -> critical. Critical stays critical.
+    """
+    if not patterns:
+        return comments
+
+    order = ["suggestion", "warning", "critical"]
+    boosted: list[ReviewComment] = []
+
+    for c in comments:
+        sev = c.severity
+        for pattern in patterns:
+            if fnmatch.fnmatch(c.file, pattern) or fnmatch.fnmatch(
+                c.file, f"**/{pattern}"
+            ):
+                idx = order.index(sev) if sev in order else 0
+                sev = order[min(idx + 1, len(order) - 1)]
+                log.debug(
+                    "CODEOWNERS boost: %s:%d  %s -> %s",
+                    c.file, c.line, c.severity, sev,
+                )
+                break
+        boosted.append(
+            ReviewComment(
+                file=c.file,
+                line=c.line,
+                severity=sev,
+                title=c.title,
+                suggestion=c.suggestion,
+                why=c.why,
+            )
+        )
+
+    return boosted
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +371,7 @@ def truncate_diff(diff: str) -> tuple[str, bool]:
 # ---------------------------------------------------------------------------
 
 
-def call_groq(
+def _call_model(
     client: Groq,
     diff: str,
     model: str,
@@ -173,14 +379,9 @@ def call_groq(
     max_tokens: int,
     system_prompt: str,
 ) -> dict[str, Any]:
-    """Submit the diff to Groq and return the parsed JSON response dict.
-
-    Retries automatically on HTTP 429 (rate limit) and transient connection
-    errors, using the delays defined in RETRY_DELAYS.  Raises on all other
-    API errors or if all attempts are exhausted.
-    """
+    """Call a single Groq model with exponential backoff on rate limits."""
     user_content = f"Review the following git diff:\n\n```diff\n{diff}\n```"
-    delays = [0] + RETRY_DELAYS  # first attempt has no delay
+    delays = [0] + RETRY_DELAYS
 
     last_exc: Exception | None = None
     for attempt, delay in enumerate(delays, start=1):
@@ -192,7 +393,9 @@ def call_groq(
             time.sleep(delay)
 
         try:
-            log.info("Groq request: model=%s  attempt=%d/%d", model, attempt, len(delays))
+            log.info(
+                "Groq request: model=%s  attempt=%d/%d", model, attempt, len(delays)
+            )
             response = client.chat.completions.create(
                 model=model,
                 messages=[
@@ -210,31 +413,73 @@ def call_groq(
         except APIStatusError as exc:
             last_exc = exc
             if exc.status_code == 429 and attempt < len(delays):
-                log.warning("Groq returned 429 on attempt %d. Will retry.", attempt)
+                log.warning("Groq 429 on attempt %d/%d. Will retry.", attempt, len(delays))
                 continue
             raise
 
         except APIConnectionError as exc:
             last_exc = exc
             if attempt < len(delays):
-                log.warning("Groq connection error on attempt %d: %s. Will retry.", attempt, exc)
+                log.warning(
+                    "Connection error on attempt %d/%d: %s. Will retry.",
+                    attempt, len(delays), exc,
+                )
                 continue
             raise
 
         except (json.JSONDecodeError, ValueError) as exc:
-            # response_format=json_object should make this extremely rare,
-            # but surface it clearly if it happens.
             log.error("Failed to parse model response as JSON: %s", exc)
             raise
 
-    raise RuntimeError("Exhausted all Groq retry attempts.") from last_exc
+    raise RuntimeError("Exhausted all retry attempts.") from last_exc
+
+
+def call_groq(
+    client: Groq,
+    diff: str,
+    primary_model: str,
+    temperature: float,
+    max_tokens: int,
+    system_prompt: str,
+) -> tuple[dict[str, Any], str]:
+    """Call Groq with an automatic model fallback chain.
+
+    Tries primary_model first, then each entry in FALLBACK_MODELS in order,
+    skipping any model Groq reports as decommissioned or not found.
+
+    Returns:
+        (parsed_response_dict, model_that_succeeded)
+    """
+    chain = [primary_model] + [m for m in FALLBACK_MODELS if m != primary_model]
+
+    for model in chain:
+        try:
+            payload = _call_model(
+                client, diff, model, temperature, max_tokens, system_prompt
+            )
+            log.info("Review completed with model: %s", model)
+            return payload, model
+        except APIStatusError as exc:
+            decommissioned = exc.status_code == 400 and any(
+                kw in str(exc).lower()
+                for kw in ("decommissioned", "model_not_found", "not found")
+            )
+            if decommissioned:
+                log.warning(
+                    "Model %s is unavailable (HTTP %d). Trying next in chain.",
+                    model, exc.status_code,
+                )
+                continue
+            raise
+
+    raise RuntimeError(f"All models in fallback chain exhausted: {chain}")
 
 
 def parse_review(payload: dict[str, Any]) -> ReviewResult:
     """Coerce the raw model output into a typed ReviewResult.
 
-    Malformed individual comment entries are logged and skipped rather than
-    crashing the entire review run.
+    Malformed individual entries are logged and skipped rather than crashing
+    the entire review run.
     """
     result = ReviewResult(summary=payload.get("summary", ""))
     valid_severities = {"critical", "warning", "suggestion"}
@@ -292,9 +537,8 @@ def post_pr_review(
 ) -> None:
     """Submit a pull request review via the GitHub Reviews API.
 
-    If inline comments cause a 422 (e.g. a line number that is not present in
-    the diff), the request is retried without inline comments so the overall
-    summary is never silently lost.
+    If inline comments cause a 422 (line not present in the diff), the request
+    is retried without them so the summary body is never silently lost.
     """
     url = f"{_GH_API}/repos/{repo}/pulls/{pull_number}/reviews"
     payload: dict[str, Any] = {
@@ -312,8 +556,8 @@ def post_pr_review(
 
     if resp.status_code == 422 and inline_comments:
         log.warning(
-            "Review rejected with inline comments (422). "
-            "Retrying with summary body only. API response: %s",
+            "Review rejected with inline comments (422); retrying without them. "
+            "API: %s",
             resp.text[:400],
         )
         payload.pop("comments")
@@ -351,14 +595,32 @@ def post_issue_comment(
 # ---------------------------------------------------------------------------
 
 
-def build_review_body(result: ReviewResult, was_truncated: bool) -> str:
+def build_review_body(
+    result: ReviewResult,
+    was_truncated: bool,
+    token_count: int,
+    model: str,
+    files_changed: int,
+    lines_added: int,
+    lines_removed: int,
+    skipped_files: list[str],
+) -> str:
     """Compose the top-level review body from the structured result."""
     parts: list[str] = ["## RaptorReview AI", ""]
 
     if was_truncated:
         parts += [
-            "> **Note:** The diff exceeded the review budget (~3 000 tokens) and "
+            "> **Note:** The diff exceeded the review budget (~3,000 tokens) and "
             "was truncated. Only the first portion of this PR was analyzed.",
+            "",
+        ]
+
+    if skipped_files:
+        skipped_display = ", ".join(f"`{f}`" for f in skipped_files[:5])
+        if len(skipped_files) > 5:
+            skipped_display += f" and {len(skipped_files) - 5} more"
+        parts += [
+            f"> **Skipped {len(skipped_files)} noise file(s):** {skipped_display}",
             "",
         ]
 
@@ -369,12 +631,18 @@ def build_review_body(result: ReviewResult, was_truncated: bool) -> str:
         parts += ["---", "", f"**{len(result.comments)} finding(s):**", ""]
         for c in result.comments:
             label = SEVERITY_LABELS.get(c.severity, c.severity.upper())
-            parts.append(f"- {label} **{c.title}** — `{c.file}:{c.line}`")
+            line_ref = f":{c.line}" if c.line > 0 else ""
+            parts.append(f"- {label} **{c.title}** — `{c.file}{line_ref}`")
         parts.append("")
 
     parts += [
         "---",
-        "_Posted by [RaptorReview AI](https://github.com/raptorreview-ai/raptorreview-ai)_",
+        f"Reviewed **{files_changed} file(s)** &nbsp;·&nbsp; "
+        f"`+{lines_added} -{lines_removed}` &nbsp;·&nbsp; "
+        f"Model: `{model}` &nbsp;·&nbsp; "
+        f"Tokens: ~{token_count:,}",
+        "",
+        "_Posted by [RaptorReview AI](https://github.com/dev-k99/raptorreview-ai)_",
     ]
     return "\n".join(parts)
 
@@ -383,29 +651,50 @@ def build_inline_comments(
     result: ReviewResult,
     diff: str,
 ) -> list[dict[str, Any]]:
-    """Convert ReviewComment objects to GitHub Reviews API comment dicts.
+    """Convert ReviewComment objects into GitHub Reviews API comment dicts.
 
-    Only includes comments where line > 0 and the file is present in the diff.
-    Comments that cannot be placed inline are captured in the review body
-    summary list instead.
+    Uses the parsed diff hunk map to validate line numbers. When the LLM
+    returns a line close to (but not exactly on) a changed line, the comment
+    is snapped to the nearest valid line within a 5-line tolerance.
     """
-    diff_files: set[str] = set(re.findall(r"^\+\+\+ b/(.+)$", diff, re.MULTILINE))
-
+    diff_line_map = parse_diff_hunks(diff)
     inline: list[dict[str, Any]] = []
+
     for c in result.comments:
         if c.line <= 0:
             continue
-        if c.file not in diff_files:
-            log.debug("Skipping inline comment for %r (file not in diff).", c.file)
+
+        valid_lines = diff_line_map.get(c.file)
+        if not valid_lines:
+            log.debug("Skipping inline comment for %r (file not in diff hunks).", c.file)
             continue
+
+        if c.line in valid_lines:
+            target_line = c.line
+        else:
+            closest = min(valid_lines, key=lambda x: abs(x - c.line))
+            if abs(closest - c.line) > 5:
+                log.debug(
+                    "Skipping inline comment for %r:%d "
+                    "(nearest diff line %d exceeds tolerance).",
+                    c.file, c.line, closest,
+                )
+                continue
+            log.debug(
+                "Snapping inline comment %r:%d -> diff line %d.",
+                c.file, c.line, closest,
+            )
+            target_line = closest
+
         inline.append(
             {
                 "path": c.file,
-                "line": c.line,
+                "line": target_line,
                 "side": "RIGHT",
                 "body": c.to_markdown(),
             }
         )
+
     return inline
 
 
@@ -422,7 +711,7 @@ def main() -> None:
     github_token  = os.environ.get("GITHUB_TOKEN",          "").strip()
     repo          = os.environ.get("GITHUB_REPOSITORY",     "")
     event_path    = os.environ.get("GITHUB_EVENT_PATH",     "")
-    model         = os.environ.get("INPUT_MODEL",           "llama-3.1-70b-versatile").strip()
+    model         = os.environ.get("INPUT_MODEL",           "llama-3.3-70b-versatile").strip()
     temperature   = float(os.environ.get("INPUT_TEMPERATURE", "0.2"))
     max_tokens    = int(os.environ.get("INPUT_MAX_TOKENS",    "2048"))
     custom_prompt = os.environ.get("INPUT_CUSTOM_PROMPT",   "").strip() or None
@@ -468,42 +757,63 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # Acquire and condition the diff
+    # Acquire, filter, and truncate the diff
     # ------------------------------------------------------------------
     raw_diff = get_diff(base_ref)
     if not raw_diff.strip():
         log.info("Empty diff — no review needed.")
         sys.exit(0)
 
-    diff, was_truncated = truncate_diff(raw_diff)
+    filtered_diff, skipped_files = filter_diff(raw_diff)
+    if skipped_files:
+        log.info("Filtered out %d noise file(s): %s", len(skipped_files), skipped_files)
+
+    if not filtered_diff.strip():
+        log.info("Diff is empty after filtering noise files — no review needed.")
+        sys.exit(0)
+
+    diff, was_truncated, token_count = truncate_diff(filtered_diff)
+    files_changed, lines_added, lines_removed = parse_diff_stats(diff)
     log.info(
-        "Diff: %d chars%s",
-        len(diff), " (truncated)" if was_truncated else "",
+        "Diff: %d tokens  %d file(s)  +%d -%d%s",
+        token_count, files_changed, lines_added, lines_removed,
+        "  (truncated)" if was_truncated else "",
     )
+
+    # ------------------------------------------------------------------
+    # Load CODEOWNERS for severity boosting
+    # ------------------------------------------------------------------
+    codeowners_patterns = load_codeowners_patterns()
 
     # ------------------------------------------------------------------
     # Call Groq and parse the structured response
     # ------------------------------------------------------------------
-    gh          = _gh_session(github_token)
-    groq_client = Groq(api_key=groq_api_key)
+    gh            = _gh_session(github_token)
+    groq_client   = Groq(api_key=groq_api_key)
     system_prompt = custom_prompt or DEFAULT_SYSTEM_PROMPT
 
     try:
-        payload = call_groq(
+        payload, model_used = call_groq(
             client=groq_client,
             diff=diff,
-            model=model,
+            primary_model=model,
             temperature=temperature,
             max_tokens=max_tokens,
             system_prompt=system_prompt,
         )
         review = parse_review(payload)
+
+        if codeowners_patterns:
+            review.comments = apply_codeowners_boost(
+                review.comments, codeowners_patterns
+            )
+
         log.info(
-            "Review parsed: %d comment(s), summary %d chars.",
-            len(review.comments), len(review.summary),
+            "Review parsed: %d comment(s), summary %d chars, model %s.",
+            len(review.comments), len(review.summary), model_used,
         )
 
-    except Exception as exc:  # noqa: BLE001 — intentional broad catch; errors here must not block CI
+    except Exception as exc:  # noqa: BLE001
         log.exception("Groq review failed: %s", exc)
         fallback_body = (
             "## RaptorReview AI\n\n"
@@ -522,8 +832,17 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Post results to GitHub
     # ------------------------------------------------------------------
-    review_body  = build_review_body(review, was_truncated)
-    inline_cmts  = build_inline_comments(review, raw_diff)
+    review_body = build_review_body(
+        result=review,
+        was_truncated=was_truncated,
+        token_count=token_count,
+        model=model_used,
+        files_changed=files_changed,
+        lines_added=lines_added,
+        lines_removed=lines_removed,
+        skipped_files=skipped_files,
+    )
+    inline_cmts = build_inline_comments(review, raw_diff)
 
     log.info("Posting review (%d inline comment(s)).", len(inline_cmts))
     post_pr_review(
