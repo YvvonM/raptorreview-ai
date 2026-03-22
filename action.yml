@@ -8,17 +8,11 @@ branding:
 
 inputs:
   groq_api_key:
-    description: >
-      Groq API key used to call the inference endpoint.
-      Store this as a repository secret and pass it via
-      ${{ secrets.GROQ_API_KEY }}.
+    description: "Groq API key. Store as a repository secret named GROQ_API_KEY."
     required: true
 
   github_token:
-    description: >
-      GitHub token used to post review comments. The default
-      ${{ github.token }} is sufficient when pull-requests: write
-      is granted in the workflow permissions block.
+    description: "GitHub token for posting review comments. The default github.token is sufficient with pull-requests: write permission."
     required: true
     default: ${{ github.token }}
 
@@ -28,7 +22,7 @@ inputs:
         - llama-3.1-70b-versatile  (recommended: thorough, slower)
         - llama-3.1-8b-instant     (faster, lighter context window)
     required: false
-    default: "llama-3.1-70b-versatile"
+    default: "llama-3.3-70b-versatile"
 
   temperature:
     description: >

@@ -23,12 +23,12 @@ jobs:
           fetch-depth: 0
 
       - name: Run RaptorReview AI
-        uses: dev-k99/raptorreview-ai@v1
+        uses: ./
         with:
           groq_api_key: ${{ secrets.GROQ_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           # Optional overrides — remove any you don't need:
-          model:         "llama-3.1-70b-versatile"
+          model:         "llama-3.3-70b-versatile"
           temperature:   "0.2"
           max_tokens:    "2048"
           # custom_prompt: ""
