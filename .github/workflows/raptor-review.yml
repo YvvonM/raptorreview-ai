@@ -23,7 +23,7 @@ jobs:
           fetch-depth: 0
 
       - name: Run RaptorReview AI
-        uses: dev-k99/raptorreview-ai@v1
+        uses: ./
         with:
           groq_api_key: ${{ secrets.GROQ_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
