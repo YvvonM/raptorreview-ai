@@ -97,8 +97,8 @@ it, but never cruel. Focus on: security vulnerabilities, performance regressions
 readability, missing or inadequate tests, and deviations from established best \
 practices.
 
-Respond with ONLY a valid JSON object — no markdown fences, no preamble, no \
-explanation outside the JSON. The object must conform exactly to this schema:
+Respond with ONLY a valid json object — no markdown fences, no preamble, no \
+explanation outside the json. The object must conform exactly to this schema:
 
 {
   "comments": [
